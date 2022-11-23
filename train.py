@@ -33,6 +33,9 @@ import sogclr.loader
 import sogclr.optimizer
 import sogclr.cifar  # cifar
 
+from collections import deque
+import numpy as np
+
 # ignore all warnings
 import warnings
 warnings.filterwarnings("ignore")
@@ -102,9 +105,9 @@ parser.add_argument('--warmup-epochs', default=10, type=int, metavar='N',
 parser.add_argument('--crop-min', default=0.08, type=float,
                     help='minimum scale for random cropping (default: 0.08)')
 
-# dataset 
-parser.add_argument('--data_name', default='cifar10', type=str) 
-parser.add_argument('--save_dir', default='./saved_models/', type=str) 
+# dataset
+parser.add_argument('--data_name', default='cifar10', type=str)
+parser.add_argument('--save_dir', default='./saved_models/', type=str)
 
 
 # sogclr
@@ -117,6 +120,22 @@ parser.add_argument('--learning-rate-scaling', default='linear', type=str,
                     choices=['sqrt', 'linear'],
                     help='learing rate scaling (default: linear)')
 
+#blending aug
+parser.add_argument('--buffer_size', default=128, type=int,
+                    help='buffer size used for blending aug')
+parser.add_argument('--blend_factor', default=0.99, type=float,
+                    help='weight on original image for blending')
+parser.add_argument('--blend_prob', default=0.2, type=float,
+                    help='with what probability to do blend aug should be (<=0 <= 1)')
+
+def blend_imgs(img1, img2, alpha):
+    """
+    img1: Source Image
+    img2: Image for pertubation
+    alpha: weight for source image (should be high)
+    """
+    assert(alpha >= 0 and alpha <= 1)
+    return alpha * img1 + (1 - alpha) * img2
 
 def main():
     args = parser.parse_args()
@@ -143,18 +162,18 @@ def main_worker(gpu, ngpus_per_node, args):
     else:
         args.gpu = 0
         print("Use GPU: {} for training".format(args.gpu))
-        
+
     # data sizes
-    if args.data_name == 'cifar10' or args.data_name == 'cifar100' : 
+    if args.data_name == 'cifar10' or args.data_name == 'cifar100' :
         data_size = 50000
     else:
-        data_size = 1000000 
+        data_size = 1000000
     print ('pretraining on %s'%args.data_name)
 
     # create model
     print("=> creating model '{}'".format(args.arch))
     model = sogclr.builder.SimCLR_ResNet(
-            partial(torchvision_models.__dict__[args.arch], zero_init_residual=True), 
+            partial(torchvision_models.__dict__[args.arch], zero_init_residual=True),
             args.dim, args.mlp_dim, args.t, cifar_head=('cifar' in args.data_name), loss_type=args.loss_type, N=data_size, num_proj_layers=args.num_proj_layers)
 
     # infer learning rate before changing batch size
@@ -162,10 +181,10 @@ def main_worker(gpu, ngpus_per_node, args):
         # linear scaling
         args.lr = args.lr * args.batch_size / 256
     else:
-        # sqrt scaling  
+        # sqrt scaling
         args.lr = args.lr * math.sqrt(args.batch_size)
-        
-    print ('initial learning rate:', args.lr)      
+
+    print ('initial learning rate:', args.lr)
     if not torch.cuda.is_available():
         print('using CPU, this will be slow')
     elif args.gpu is not None:
@@ -180,17 +199,17 @@ def main_worker(gpu, ngpus_per_node, args):
     elif args.optimizer == 'adamw':
         optimizer = torch.optim.AdamW(model.parameters(), args.lr,
                                 weight_decay=args.weight_decay)
-        
+
     scaler = torch.cuda.amp.GradScaler()
-   
-    # log_dir 
+
+    # log_dir
     save_root_path = args.save_dir
     global_batch_size = args.batch_size
     method_name = {'dcl': 'sogclr', 'cl': 'simclr'}[args.loss_type]
     logdir = '20221013_%s_%s_%s-%s-%s_bz_%s_E%s_WR%s_lr_%.3f_%s_wd_%s_t_%s_g_%s_%s'%(args.data_name, args.arch, method_name, args.dim, args.mlp_dim, global_batch_size, args.epochs, args.warmup_epochs, args.lr, args.learning_rate_scaling, args.weight_decay, args.t, args.gamma, args.optimizer )
     summary_writer = SummaryWriter(log_dir=os.path.join(save_root_path, logdir))
     print (logdir)
-    
+
     # optionally resume from a checkpoint
     if args.resume:
         if os.path.isfile(args.resume):
@@ -211,11 +230,11 @@ def main_worker(gpu, ngpus_per_node, args):
             print("=> no checkpoint found at '{}'".format(args.resume))
 
     cudnn.benchmark = True
-    
+
 
     # Data loading code
     mean = {'cifar10':      [0.4914, 0.4822, 0.4465],
-            'cifar100':     [0.4914, 0.4822, 0.4465] 
+            'cifar100':     [0.4914, 0.4822, 0.4465]
             }[args.data_name]
     std = {'cifar10':      [0.2470, 0.2435, 0.2616],
             'cifar100':     [0.2470, 0.2435, 0.2616]
@@ -235,21 +254,21 @@ def main_worker(gpu, ngpus_per_node, args):
         transforms.ToTensor(),
         normalize
     ]
-    
+
     if args.data_name == 'cifar10':
         DATA_ROOT = args.data
-        train_dataset = sogclr.cifar.CIFAR10(root=DATA_ROOT, train=True, download=True, 
-                                           transform=sogclr.loader.TwoCropsTransform(transforms.Compose(augmentation1), 
+        train_dataset = sogclr.cifar.CIFAR10(root=DATA_ROOT, train=True, download=True,
+                                           transform=sogclr.loader.TwoCropsTransform(transforms.Compose(augmentation1),
                                                                                    transforms.Compose(augmentation1)))
     elif args.data_name == 'cifar100':
         DATA_ROOT = args.data
-        train_dataset = sogclr.cifar.CIFAR100(root=DATA_ROOT, train=True, download=True, 
-                                           transform=sogclr.loader.TwoCropsTransform(transforms.Compose(augmentation1), 
+        train_dataset = sogclr.cifar.CIFAR100(root=DATA_ROOT, train=True, download=True,
+                                           transform=sogclr.loader.TwoCropsTransform(transforms.Compose(augmentation1),
                                                                                    transforms.Compose(augmentation1)))
     else:
         raise ValueError
 
- 
+
     train_sampler = None
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
@@ -267,9 +286,9 @@ def main_worker(gpu, ngpus_per_node, args):
                 'optimizer' : optimizer.state_dict(),
                 'scaler': scaler.state_dict(),
             }, is_best=False, filename=os.path.join(save_root_path, logdir, 'checkpoint_%04d.pth.tar' % epoch) )
-        
+
     summary_writer.close()
-    
+
 
 def train(train_loader, model, optimizer, scaler, summary_writer, epoch, args):
     batch_time = AverageMeter('Time', ':6.3f')
@@ -287,6 +306,11 @@ def train(train_loader, model, optimizer, scaler, summary_writer, epoch, args):
     end = time.time()
     iters_per_epoch = len(train_loader)
 
+    # Init queues
+    image_q = deque(maxlen=args.buffer_size)
+    embed_q = deque(maxlen=args.buffer_size)
+    distance = lambda x, y: np.mean((x - y) ** 2)
+
     for i, (images, _, index) in enumerate(train_loader):
         # measure data loading time
         data_time.update(time.time() - end)
@@ -298,6 +322,18 @@ def train(train_loader, model, optimizer, scaler, summary_writer, epoch, args):
         if args.gpu is not None:
             images[0] = images[0].cuda(args.gpu, non_blocking=True)
             images[1] = images[1].cuda(args.gpu, non_blocking=True)
+
+        # do the blend aug if chance
+        print(images[0].shape)  # check back size!!!
+
+        if len(image_q) == args.buffer_size and random.random() < args.blend_prob:
+
+            with torch.no_grad():
+                h1 = model.base_encoder(images[0])
+            dists = [distance(h1, x) for x in embed_q]
+            img = image_q[np.armgax(dists)]
+            images[1] = blend_imgs(images[1], img, args.blend_prob)
+
 
         # compute output
         with torch.cuda.amp.autocast(True):
@@ -371,7 +407,7 @@ class ProgressMeter(object):
 def adjust_learning_rate(optimizer, epoch, args):
     """Decays the learning rate with half-cycle cosine after warmup"""
     if epoch < args.warmup_epochs:
-        lr = args.lr * epoch / args.warmup_epochs 
+        lr = args.lr * epoch / args.warmup_epochs
     else:
         lr = args.lr * 0.5 * (1. + math.cos(math.pi * (epoch - args.warmup_epochs) / (args.epochs - args.warmup_epochs)))
     for param_group in optimizer.param_groups:
