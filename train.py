@@ -332,7 +332,7 @@ def train(train_loader, model, optimizer, scaler, summary_writer, epoch, args):
                 h1 = model.base_encoder(images[0])
             dists = [distance(h1, x) for x in embed_q]
             img = image_q[np.armgax(dists)]
-            images[1] = blend_imgs(images[1], img, args.blend_prob)
+            images[1] = blend_imgs(images[1], img, args.blend_factor)
 
 
         # compute output
