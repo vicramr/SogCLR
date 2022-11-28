@@ -16,6 +16,7 @@ import shutil
 import time
 import warnings
 from functools import partial
+import sys
 
 import torch
 import torch.nn as nn
@@ -122,7 +123,7 @@ parser.add_argument('--learning-rate-scaling', default='linear', type=str,
 
 #blending aug
 parser.add_argument('--buffer_size', default=128, type=int,
-                    help='buffer size used for blending aug')
+                    help='buffer size used for blending aug, should be a multiple of batch-size')
 parser.add_argument('--blend_factor', default=0.99, type=float,
                     help='weight on original image for blending')
 parser.add_argument('--blend_prob', default=0.2, type=float,
@@ -169,6 +170,9 @@ def main_worker(gpu, ngpus_per_node, args):
     else:
         data_size = 1000000
     print ('pretraining on %s'%args.data_name)
+
+    if args.buffer_size % args.batch_size != 0:
+        raise ValueError('buffer_size should be a multiple of batch_size.')
 
     # create model
     print("=> creating model '{}'".format(args.arch))
@@ -307,9 +311,9 @@ def train(train_loader, model, optimizer, scaler, summary_writer, epoch, args):
     iters_per_epoch = len(train_loader)
 
     # Init queues
-    image_q = deque(maxlen=args.buffer_size)
-    embed_q = deque(maxlen=args.buffer_size)
-    distance = lambda x, y: np.mean((x - y) ** 2)
+    queue_len = args.buffer_size // args.batch_size # Number of batches in the queue
+    image_q = deque(maxlen=queue_len)
+    embed_q = deque(maxlen=queue_len)
 
     for i, (images, _, index) in enumerate(train_loader):
         # measure data loading time
@@ -323,17 +327,32 @@ def train(train_loader, model, optimizer, scaler, summary_writer, epoch, args):
             images[0] = images[0].cuda(args.gpu, non_blocking=True)
             images[1] = images[1].cuda(args.gpu, non_blocking=True)
 
-        # do the blend aug if chance
-        print(images[0].shape)  # check back size!!!
+        # do the blend aug if chance, then update queues
+        with torch.no_grad():
+            h0 = model.base_encoder(images[0])
+            assert h0.shape == (images[0].shape[0], args.dim)
 
-        if len(image_q) == args.buffer_size and random.random() < args.blend_prob:
+        if len(image_q) == queue_len and random.random() < args.blend_prob:
+            # Concat the batches in the queue into a single tensor, then compute
+            # distances between each query vector and every element in the queue using cdist
+            embedding_queue_tensor = torch.cat([b for b in embed_q], dim=0)
+            assert embedding_queue_tensor.shape == (args.buffer_size, args.dim)
+            embedding_queue_tensor = torch.unsqueeze(embedding_queue_tensor, dim=0)
+            query_vectors = torch.unsqueeze(h0, dim=0)
+            distances = torch.cdist(query_vectors, embedding_queue_tensor).squeeze()
+            highest_distance_indices = torch.argmax(distances, dim=1)
+            assert highest_distance_indices.shape == (images[0].shape[0],)
 
-            with torch.no_grad():
-                h1 = model.base_encoder(images[0])
-            dists = [distance(h1, x) for x in embed_q]
-            img = image_q[np.armgax(dists)]
-            images[1] = blend_imgs(images[1], img, args.blend_factor)
+            image_queue_tensor = torch.cat([b for b in image_q], dim=0)
+            images_to_blend = image_queue_tensor[highest_distance_indices, ...]
+            assert images_to_blend.shape == images[0].shape
 
+            # Replace the second augmentation with the first image blended
+            images[1] = blend_imgs(images[0], images_to_blend, args.blend_factor)
+
+        # Regardless of whether we blend, still update queues
+        image_q.append(images[0])
+        embed_q.append(h0)
 
         # compute output
         with torch.cuda.amp.autocast(True):
