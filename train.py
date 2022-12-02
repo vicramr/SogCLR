@@ -6,7 +6,7 @@
 # LICENSE file in the root directory of this source tree.
 
 # This codebase is modified based on moco implementations: https://github.com/facebookresearch/moco
-
+import pdb
 import argparse
 import builtins
 import math
@@ -128,6 +128,10 @@ parser.add_argument('--blend_factor', default=0.99, type=float,
                     help='weight on original image for blending')
 parser.add_argument('--blend_prob', default=0.2, type=float,
                     help='with what probability to do blend aug should be (<=0 <= 1)')
+parser.add_argument('--alternate_perturb', action='store_true',
+                    help='if given, do perturbation in a different way: using nearby negative vectors')
+parser.add_argument('--use_closest', action='store_true',
+                    help='if given, use closest vectors to choose examples for blending. By default, use furthest.')
 
 def blend_imgs(img1, img2, alpha):
     """
@@ -210,7 +214,7 @@ def main_worker(gpu, ngpus_per_node, args):
     save_root_path = args.save_dir
     global_batch_size = args.batch_size
     method_name = {'dcl': 'sogclr', 'cl': 'simclr'}[args.loss_type]
-    logdir = '20221013_%s_%s_%s-%s-%s_bz_%s_E%s_WR%s_lr_%.3f_%s_wd_%s_t_%s_g_%s_%s'%(args.data_name, args.arch, method_name, args.dim, args.mlp_dim, global_batch_size, args.epochs, args.warmup_epochs, args.lr, args.learning_rate_scaling, args.weight_decay, args.t, args.gamma, args.optimizer )
+    logdir = '20221013_%s_%s_%s-%s-%s_bz_%s_E%s_WR%s_lr_%.3f_%s_wd_%s_t_%s_g_%s_%s_buff_%s_bf_%.3f_prob_%.3f_alt_%s_close_%s'%(args.data_name, args.arch, method_name, args.dim, args.mlp_dim, global_batch_size, args.epochs, args.warmup_epochs, args.lr, args.learning_rate_scaling, args.weight_decay, args.t, args.gamma, args.optimizer, args.buffer_size, args.blend_factor, args.blend_prob, args.alternate_perturb, args.use_closest )
     summary_writer = SummaryWriter(log_dir=os.path.join(save_root_path, logdir))
     print (logdir)
 
@@ -315,6 +319,8 @@ def train(train_loader, model, optimizer, scaler, summary_writer, epoch, args):
     image_q = deque(maxlen=queue_len)
     embed_q = deque(maxlen=queue_len)
 
+    num_batches_perturbed = 0 # Number times this epoch that the batch perturbation has triggered
+
     for i, (images, _, index) in enumerate(train_loader):
         # measure data loading time
         data_time.update(time.time() - end)
@@ -326,29 +332,45 @@ def train(train_loader, model, optimizer, scaler, summary_writer, epoch, args):
         if args.gpu is not None:
             images[0] = images[0].cuda(args.gpu, non_blocking=True)
             images[1] = images[1].cuda(args.gpu, non_blocking=True)
-
         # do the blend aug if chance, then update queues
         with torch.no_grad():
             h0 = model.base_encoder(images[0])
             assert h0.shape == (images[0].shape[0], args.dim)
 
+        performing_perturb = False
         if len(image_q) == queue_len and random.random() < args.blend_prob:
+            performing_perturb = True
+            num_batches_perturbed += 1
             # Concat the batches in the queue into a single tensor, then compute
             # distances between each query vector and every element in the queue using cdist
+            # NOTE: everything in embed_q is a negative example, as they are all previous batches
+            # in the same epoch.
             embedding_queue_tensor = torch.cat([b for b in embed_q], dim=0)
             assert embedding_queue_tensor.shape == (args.buffer_size, args.dim)
             embedding_queue_tensor = torch.unsqueeze(embedding_queue_tensor, dim=0)
             query_vectors = torch.unsqueeze(h0, dim=0)
             distances = torch.cdist(query_vectors, embedding_queue_tensor).squeeze()
-            highest_distance_indices = torch.argmax(distances, dim=1)
-            assert highest_distance_indices.shape == (images[0].shape[0],)
+            if args.use_closest:
+                distance_indices = torch.argmin(distances, dim=1)
+            else:
+                distance_indices = torch.argmax(distances, dim=1)
+            assert distance_indices.shape == (images[0].shape[0],)
+            if args.alternate_perturb:
+                assert False # TODO as of now, alternate_perturb is buggy and shouldn't be used.
+                # Take the chosen embedding vector for each query vector and perturb in that direction.
+                vectors_to_blend = (embedding_queue_tensor.squeeze())[distance_indices, ...]
+                assert vectors_to_blend.shape == h0.shape
+                vectors = (h0, blend_imgs(h0, vectors_to_blend, args.blend_factor))
 
-            image_queue_tensor = torch.cat([b for b in image_q], dim=0)
-            images_to_blend = image_queue_tensor[highest_distance_indices, ...]
-            assert images_to_blend.shape == images[0].shape
+            else:
+                # Take the image corresponding to the chosen embedding vector for each query vector
+                # and blend the source images.
+                image_queue_tensor = torch.cat([b for b in image_q], dim=0)
+                images_to_blend = image_queue_tensor[distance_indices, ...]
+                assert images_to_blend.shape == images[0].shape
 
-            # Replace the second augmentation with the first image blended
-            images[1] = blend_imgs(images[0], images_to_blend, args.blend_factor)
+                # Replace the second augmentation with the first image blended
+                images[1] = blend_imgs(images[0], images_to_blend, args.blend_factor)
 
         # Regardless of whether we blend, still update queues
         image_q.append(images[0])
@@ -356,7 +378,18 @@ def train(train_loader, model, optimizer, scaler, summary_writer, epoch, args):
 
         # compute output
         with torch.cuda.amp.autocast(True):
-            loss = model(images[0], images[1], index, args.gamma)
+            if args.alternate_perturb and performing_perturb:
+                assert False # TODO as of now, alternate_perturb is buggy and shouldn't be used.
+                # Because this method perturbs the embedding vectors directly, must explicitly
+                # pass those to the loss rather than just calling model.forward.
+                h1, h2 = vectors
+                if model.loss_type == 'dcl':
+                    loss = model.dynamic_contrastive_loss(h1, h2, index, args.gamma)
+                elif model.loss_type == 'cl':
+                    loss = model.contrastive_loss(h1, h2)
+                del vectors # Sanity check: ensure that if vectors is used above, it was created this iter.
+            else:
+                loss = model(images[0], images[1], index, args.gamma)
 
         losses.update(loss.item(), images[0].size(0))
 
@@ -374,6 +407,7 @@ def train(train_loader, model, optimizer, scaler, summary_writer, epoch, args):
 
         if i % args.print_freq == 0:
             progress.display(i)
+            print('Num batches perturbed so far this epoch:', num_batches_perturbed)
 
 
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
