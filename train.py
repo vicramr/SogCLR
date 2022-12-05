@@ -355,17 +355,16 @@ def train(train_loader, model, optimizer, scaler, summary_writer, epoch, args):
             else:
                 distance_indices = torch.argmax(distances, dim=1)
             assert distance_indices.shape == (images[0].shape[0],)
-            if args.alternate_perturb:
-                assert False # TODO as of now, alternate_perturb is buggy and shouldn't be used.
-                # Take the chosen embedding vector for each query vector and perturb in that direction.
-                vectors_to_blend = (embedding_queue_tensor.squeeze())[distance_indices, ...]
-                assert vectors_to_blend.shape == h0.shape
-                vectors = (h0, blend_imgs(h0, vectors_to_blend, args.blend_factor))
 
+            image_queue_tensor = torch.cat([b for b in image_q], dim=0)
+            if args.alternate_perturb:
+                # Save the embedding vector for each sample; embedding vectors will be computed below
+                # when computing the loss. This is to ensure that backpropagation works as desired.
+                images_for_adv_vectors = image_queue_tensor[distance_indices, ...]
+                images[1] = images_for_adv_vectors
             else:
                 # Take the image corresponding to the chosen embedding vector for each query vector
                 # and blend the source images.
-                image_queue_tensor = torch.cat([b for b in image_q], dim=0)
                 images_to_blend = image_queue_tensor[distance_indices, ...]
                 assert images_to_blend.shape == images[0].shape
 
@@ -379,15 +378,15 @@ def train(train_loader, model, optimizer, scaler, summary_writer, epoch, args):
         # compute output
         with torch.cuda.amp.autocast(True):
             if args.alternate_perturb and performing_perturb:
-                assert False # TODO as of now, alternate_perturb is buggy and shouldn't be used.
                 # Because this method perturbs the embedding vectors directly, must explicitly
                 # pass those to the loss rather than just calling model.forward.
-                h1, h2 = vectors
+                h1 = model.base_encoder(images[0])
+                h_adv = model.base_encoder(images[1]) # h_adv are the "target" vectors to perturb towards
+                h2 = blend_imgs(h1, h_adv, args.blend_factor)
                 if model.loss_type == 'dcl':
                     loss = model.dynamic_contrastive_loss(h1, h2, index, args.gamma)
                 elif model.loss_type == 'cl':
                     loss = model.contrastive_loss(h1, h2)
-                del vectors # Sanity check: ensure that if vectors is used above, it was created this iter.
             else:
                 loss = model(images[0], images[1], index, args.gamma)
 
