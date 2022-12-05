@@ -77,6 +77,13 @@ parser.add_argument('--pretrained', default='', type=str,
 parser.add_argument('--data_name', default='cifar10', type=str) 
 parser.add_argument('--save_dir', default='./saved_models/', type=str) 
 
+# training-validation data split
+parser.add_argument('--no_test_data', action='store_true',
+                   help='if given, split the validation dataset from the training '
+                        'data instead of using test data.')
+parser.add_argument('--valid_size', default=10000, type=int,
+                    help='Size of the validation dataset (only used if --no_test_data given')
+
 best_acc1 = 0
 
 def main():
@@ -237,51 +244,64 @@ def main_worker(gpu, ngpus_per_node, args):
 
     image_size = {'cifar10':32, 'cifar100':32}[args.data_name]
     normalize = transforms.Normalize(mean=mean, std=std)
+
+    DATASPLIT_SEED = 6
+
+    train_transform = transforms.Compose([
+        transforms.RandomResizedCrop(32),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        normalize,])
+
+    val_transform = transforms.Compose([
+        transforms.ToTensor(),
+        normalize,])
     
     if args.data_name == 'cifar10':
         DATA_ROOT = args.data
-        train_dataset = datasets.CIFAR10(root=DATA_ROOT, train=True, download=True, transform=transforms.Compose([
-                                                                                            transforms.RandomResizedCrop(32),
-                                                                                            transforms.RandomHorizontalFlip(),
-                                                                                            transforms.ToTensor(),
-                                                                                            normalize,]))
+        train_dataset = datasets.CIFAR10(root=DATA_ROOT, train=True, download=True)
     elif args.data_name == 'cifar100':
         DATA_ROOT = args.data
-        train_dataset = datasets.CIFAR100(root=DATA_ROOT, train=True, download=True, transform=transforms.Compose([
-                                                                                            transforms.RandomResizedCrop(32),
-                                                                                            transforms.RandomHorizontalFlip(),
-                                                                                            transforms.ToTensor(),
-                                                                                            normalize,]))
+        train_dataset = datasets.CIFAR100(root=DATA_ROOT, train=True, download=True)
     else:
         raise ValueError
 
-        
+    # validation 
+    if args.data_name == 'cifar10':
+            DATA_ROOT = args.data
+            if args.no_test_data:
+                train_dataset, val_dataset = torch.utils.data.random_split(
+                    train_dataset,
+                    [len(train_dataset) - args.valid_size, args.valid_size],
+                    generator=torch.Generator().manual_seed(DATASPLIT_SEED)
+                )
+            else:
+                val_dataset = datasets.CIFAR10(root=DATA_ROOT, train=False, download=True)
+
+    elif args.data_name == 'cifar100':
+            DATA_ROOT = args.data
+            if args.no_test_data:
+                train_dataset, val_dataset = torch.utils.data.random_split(
+                    train_dataset,
+                    [len(train_dataset) - args.valid_size, args.valid_size],
+                    generator=torch.Generator().manual_seed(DATASPLIT_SEED)
+                )
+            else:
+                val_dataset = datasets.CIFAR100(root=DATA_ROOT, train=False, download=True)
+    else:
+        raise ValueError
+
+    train_dataset = DatasetWrapper(train_dataset, train_transform)
+    val_dataset = DatasetWrapper(val_dataset, val_transform)
+
     train_sampler = None
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
         num_workers=args.workers, pin_memory=True, sampler=train_sampler)
 
-    # validation 
-    if args.data_name == 'cifar10':
-            DATA_ROOT = args.data
-            val_dataset = datasets.CIFAR10(root=DATA_ROOT, train=False, download=True, transform=transforms.Compose([
-                                                                                            transforms.ToTensor(),
-                                                                                            normalize,]))
-            val_loader = torch.utils.data.DataLoader(
-                val_dataset, batch_size=1024, shuffle=False,
-                num_workers=args.workers, pin_memory=True)
-
-    elif args.data_name == 'cifar100':
-            DATA_ROOT = args.data
-            val_dataset = datasets.CIFAR100(root=DATA_ROOT, train=False, download=True, transform=transforms.Compose([
-                                                                                            transforms.ToTensor(),
-                                                                                            normalize,]))
-            val_loader = torch.utils.data.DataLoader(
-                val_dataset, batch_size=1024, shuffle=False,
-                num_workers=args.workers, pin_memory=True)
-    else:
-        raise ValueError
-
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset, batch_size=1024, shuffle=False,
+        num_workers=args.workers, pin_memory=True)
 
     if args.evaluate:
         validate(val_loader, model, criterion, args)
@@ -506,6 +526,27 @@ def accuracy(output, target, topk=(1,)):
             res.append(correct_k.mul_(100.0 / batch_size))
         return res
 
+class DatasetWrapper(torch.utils.data.Dataset):
+    """
+    Wrapper around an existing Dataset which will apply a transform
+    before returning samples. Useful with random_split() to use different
+    transforms for training and validation data.
+
+    Based on code from this forum post:
+    https://discuss.pytorch.org/t/torch-utils-data-dataset-random-split/32209/4
+    """
+    def __init__(self, subset, transform=None):
+        self.subset = subset
+        self.transform = transform
+
+    def __getitem__(self, index):
+        x, y = self.subset[index]
+        if self.transform is not None:
+            x = self.transform(x)
+        return x, y
+
+    def __len__(self):
+        return len(self.subset)
 
 if __name__ == '__main__':
     main()
