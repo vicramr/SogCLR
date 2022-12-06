@@ -133,6 +133,20 @@ parser.add_argument('--alternate_perturb', action='store_true',
 parser.add_argument('--use_closest', action='store_true',
                     help='if given, use closest vectors to choose examples for blending. By default, use furthest.')
 
+# CLAE "regularization" term options
+parser.add_argument('--use_adv_loss', action='store_true',
+                    help="if given, don't perform blending aug. Instead compute additional loss term for adv training.")
+parser.add_argument('--reg_strength', default=1.0, type=float,
+                    help='Float scalar to multiply regularization term by. This is alpha in the CLAE paper.')
+parser.add_argument('--epsilon', default=5.0, type=float, dest='epsilon_do_not_use_directly', # NOTE epsilon must be scaled to get it in the proper range for this data.
+                    help='Epsilon to use for adversarial perturbation. This should be a value in range [0, 255].')
+parser.add_argument('--adv_loss_type', default='cl', type=str,
+                    choices=['dcl', 'cl'],
+                    help='Which loss function to use when generating the adversarial perturbations.')
+# NOTE: for now, not performing clipping.
+# TODO other options to add:
+# adv batch norm momentum (after implementing separate batch norm)
+
 def blend_imgs(img1, img2, alpha):
     """
     img1: Source Image
@@ -178,6 +192,24 @@ def main_worker(gpu, ngpus_per_node, args):
     if args.buffer_size % args.batch_size != 0:
         raise ValueError('buffer_size should be a multiple of batch_size.')
 
+    if args.use_adv_loss:
+        if args.blend_prob > 0.0 or args.alternate_perturb or args.use_closest:
+            raise ValueError('use_adv_loss is given, this means blend_prob should be 0 and other options for blending aug are irrelevant')
+        if args.adv_loss_type == 'dcl':
+            print('WARNING: adv_loss_type should probably be cl and not dcl. When dcl is used, data structures like model.u will be updated when you may not have wanted.')
+
+    if args.blend_prob > 0.0 or args.alternate_perturb or args.use_closest:
+        if args.use_adv_loss:
+            raise ValueError('use_adv_loss is not compatible with nonzero blend_prob, alternate_perturb, or use_closest')
+
+    # Use ranges induced by normalization (below) to correct epsilon
+    CLIP_MIN = -1.98947368
+    CLIP_MAX = 2.12648871
+    OVERALL_RANGE = CLIP_MAX - CLIP_MIN
+    global EPSILON
+    EPSILON = (args.epsilon_do_not_use_directly / 255.0) * OVERALL_RANGE
+    print('Epsilon passed on command line:', args.epsilon_do_not_use_directly, 'Epsilon when corrected for normalization:', EPSILON)
+
     # create model
     print("=> creating model '{}'".format(args.arch))
     model = sogclr.builder.SimCLR_ResNet(
@@ -214,7 +246,7 @@ def main_worker(gpu, ngpus_per_node, args):
     save_root_path = args.save_dir
     global_batch_size = args.batch_size
     method_name = {'dcl': 'sogclr', 'cl': 'simclr'}[args.loss_type]
-    logdir = '20221013_%s_%s_%s-%s-%s_bz_%s_E%s_WR%s_lr_%.3f_%s_wd_%s_t_%s_g_%s_%s_buff_%s_bf_%.3f_prob_%.3f_alt_%s_close_%s'%(args.data_name, args.arch, method_name, args.dim, args.mlp_dim, global_batch_size, args.epochs, args.warmup_epochs, args.lr, args.learning_rate_scaling, args.weight_decay, args.t, args.gamma, args.optimizer, args.buffer_size, args.blend_factor, args.blend_prob, args.alternate_perturb, args.use_closest )
+    logdir = '20221013_%s_%s_%s-%s-%s_bz_%s_E%s_WR%s_lr_%.3f_%s_wd_%s_t_%s_g_%s_%s_buff_%s_bf_%.3f_prob_%.3f_alt_%s_close_%s_adv_%s_reg_%.3f_eps_%.3f_advloss_%s'%(args.data_name, args.arch, method_name, args.dim, args.mlp_dim, global_batch_size, args.epochs, args.warmup_epochs, args.lr, args.learning_rate_scaling, args.weight_decay, args.t, args.gamma, args.optimizer, args.buffer_size, args.blend_factor, args.blend_prob, args.alternate_perturb, args.use_closest, args.use_adv_loss, args.reg_strength, args.epsilon_do_not_use_directly, args.adv_loss_type )
     summary_writer = SummaryWriter(log_dir=os.path.join(save_root_path, logdir))
     print (logdir)
 
@@ -332,6 +364,7 @@ def train(train_loader, model, optimizer, scaler, summary_writer, epoch, args):
         if args.gpu is not None:
             images[0] = images[0].cuda(args.gpu, non_blocking=True)
             images[1] = images[1].cuda(args.gpu, non_blocking=True)
+        images_shallow_copy = [x for x in images]
         # do the blend aug if chance, then update queues
         with torch.no_grad():
             h0 = model.base_encoder(images[0])
@@ -339,6 +372,7 @@ def train(train_loader, model, optimizer, scaler, summary_writer, epoch, args):
 
         performing_perturb = False
         if len(image_q) == queue_len and random.random() < args.blend_prob:
+            assert not args.use_adv_loss
             performing_perturb = True
             num_batches_perturbed += 1
             # Concat the batches in the queue into a single tensor, then compute
@@ -375,9 +409,15 @@ def train(train_loader, model, optimizer, scaler, summary_writer, epoch, args):
         image_q.append(images[0])
         embed_q.append(h0)
 
+        if args.use_adv_loss:
+            assert not performing_perturb
+            assert not args.alternate_perturb
+            assert not args.use_closest
+
         # compute output
         with torch.cuda.amp.autocast(True):
             if args.alternate_perturb and performing_perturb:
+                assert not args.use_adv_loss
                 # Because this method perturbs the embedding vectors directly, must explicitly
                 # pass those to the loss rather than just calling model.forward.
                 h1 = model.base_encoder(images[0])
@@ -389,6 +429,38 @@ def train(train_loader, model, optimizer, scaler, summary_writer, epoch, args):
                     loss = model.contrastive_loss(h1, h2)
             else:
                 loss = model(images[0], images[1], index, args.gamma)
+
+                if args.use_adv_loss:
+                    # Compute adversarial loss. Add it to the previous loss as a regularization term.
+                    # Adversarial perturbation inspired by code from:
+                    # https://github.com/chihhuiho/CLAE/blob/main/SimCLR/main.py
+                    # https://github.com/cleverhans-lab/cleverhans/blob/master/cleverhans/torch/attacks/fast_gradient_method.py
+                    image1 = images_shallow_copy[0]
+                    image1_grad_copy = image1.clone().detach().requires_grad_(True) # analogous to x_j_adv from CLAE gen_adv() function
+                    # Computing tmp_loss: copy the code from model.forward, but use adv_loss_type
+                    h1 = model.base_encoder(image1)
+                    h1_grad_copy = model.base_encoder(image1_grad_copy)
+                    if args.adv_loss_type == 'dcl':
+                        tmp_loss = model.dynamic_contrastive_loss(h1, h1_grad_copy, index, args.gamma)
+                    else:
+                        assert args.adv_loss_type == 'cl'
+                        tmp_loss = model.contrastive_loss(h1, h1_grad_copy)
+                    tmp_loss.backward()
+                    optimal_perturbation = EPSILON * torch.sign(image1_grad_copy.grad) # Perturbation under L-inf norm
+                    image1_adv = image1_grad_copy + optimal_perturbation
+                    image1_adv = image1_adv.detach()
+                    # image1_adv is analogous to the output of the CLAE gen_adv() function
+                    # Next, compute adv_loss, the actual regularization loss.
+                    h1_again = model.base_encoder(image1)
+                    h1_adv = model.base_encoder(image1_adv)
+                    if args.adv_loss_type == 'dcl':
+                        adv_loss = model.dynamic_contrastive_loss(h1_again, h1_adv, index, args.gamma)
+                    else:
+                        assert args.adv_loss_type == 'cl'
+                        adv_loss = model.contrastive_loss(h1_again, h1_adv)
+
+                    # All this was needed just so we can add a regularization term to the loss.
+                    loss += args.reg_strength * adv_loss
 
         losses.update(loss.item(), images[0].size(0))
 
