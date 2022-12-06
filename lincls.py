@@ -25,12 +25,16 @@ import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as torchvision_models
 from torch.utils.tensorboard import SummaryWriter
+from cleverhans.torch.attacks import fast_gradient_method
+import numpy as np
 
 torchvision_model_names = sorted(name for name in torchvision_models.__dict__
     if name.islower() and not name.startswith("__")
     and callable(torchvision_models.__dict__[name]))
 
 model_names = torchvision_model_names
+
+VAL_BATCH_SIZE = 128
 
 parser = argparse.ArgumentParser(description='PyTorch CIFAR Training')
 parser.add_argument('--data', metavar='DIR', default='./data/',
@@ -84,7 +88,35 @@ parser.add_argument('--no_test_data', action='store_true',
 parser.add_argument('--valid_size', default=10000, type=int,
                     help='Size of the validation dataset (only used if --no_test_data given')
 
+# Attack
+parser.add_argument('--do_attack', action='store_true')
+parser.add_argument('--epsilon', default=5.0, type=float, dest='epsilon_do_not_use_directly', # NOTE epsilon must be scaled to get it in the proper range for this data.
+                    help='Epsilon to use for adversarial perturbation. This should be a value in range [0, 255].')
+
 best_acc1 = 0
+
+CLIP_MIN = -1.98947368
+CLIP_MAX = 2.12648871
+OVERALL_RANGE = CLIP_MAX - CLIP_MIN
+assert np.allclose(OVERALL_RANGE, 4.11596239057603)
+
+# >>> import numpy as np
+# >>> range = np.array([[0,1],[0,1],[0,1]], dtype=float)
+# >>> range_sub = range - np.array([[0.4914], [0.4822], [0.4465]])
+# >>> range_sub
+# array([[-0.4914,  0.5086],
+#        [-0.4822,  0.5178],
+#        [-0.4465,  0.5535]])
+# >>> range_final = range_sub / np.array([[0.2470], [0.2435], [0.2616]])
+# >>> range_final
+# array([[-1.98947368,  2.05910931],
+#        [-1.98028747,  2.12648871],
+#        [-1.70680428,  2.11582569]])
+# >>> np.amin(range_final)
+# -1.9894736842105263
+# >>> np.amax(range_final)
+# 2.126488706365503
+
 
 def main():
     args = parser.parse_args()
@@ -112,6 +144,11 @@ def main_worker(gpu, ngpus_per_node, args):
 
     if args.gpu is not None:
         print("Use GPU: {} for training".format(args.gpu))
+
+    # Use ranges induced by normalization to correct epsilon
+    global EPSILON
+    EPSILON = (args.epsilon_do_not_use_directly / 255.0) * OVERALL_RANGE
+    print('Epsilon passed on command line:', args.epsilon_do_not_use_directly, 'Epsilon when corrected for normalization:', EPSILON)
 
     # create model
     print("=> creating model '{}'".format(args.arch))
@@ -300,7 +337,7 @@ def main_worker(gpu, ngpus_per_node, args):
         num_workers=args.workers, pin_memory=True, sampler=train_sampler)
 
     val_loader = torch.utils.data.DataLoader(
-        val_dataset, batch_size=1024, shuffle=False,
+        val_dataset, batch_size=VAL_BATCH_SIZE, shuffle=False,
         num_workers=args.workers, pin_memory=True)
 
     if args.evaluate:
@@ -400,34 +437,49 @@ def validate(val_loader, model, criterion, args):
     # switch to evaluate mode
     model.eval()
 
-    with torch.no_grad():
-        end = time.time()
-        for i, (images, target) in enumerate(val_loader):
-            if args.gpu is not None:
-                images = images.cuda(args.gpu, non_blocking=True)
-            if torch.cuda.is_available():
-                target = target.cuda(args.gpu, non_blocking=True)
+    end = time.time()
+    for i, (images, target) in enumerate(val_loader):
+        if args.gpu is not None:
+            images = images.cuda(args.gpu, non_blocking=True)
+        if torch.cuda.is_available():
+            target = target.cuda(args.gpu, non_blocking=True)
 
-            # compute output
-            output = model(images)
-            loss = criterion(output, target)
-
-            # measure accuracy and record loss
-            acc1, acc5 = accuracy(output, target, topk=(1, 5))
-            losses.update(loss.item(), images.size(0))
-            top1.update(acc1[0], images.size(0))
-            top5.update(acc5[0], images.size(0))
-
-            # measure elapsed time
-            batch_time.update(time.time() - end)
-            end = time.time()
-
+        if args.do_attack:
             if i % args.print_freq == 0:
-                progress.display(i)
+                print('Doing attack')
+            adv_images = fast_gradient_method.fast_gradient_method(
+                model,
+                images,
+                eps=EPSILON,
+                norm=np.inf,
+                clip_min=CLIP_MIN,
+                clip_max=CLIP_MAX,
+                y=target,
+                targeted=False,
+                sanity_checks=False
+            )
+            images = adv_images
 
-        # TODO: this should also be done with the ProgressMeter
-        print(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'
-              .format(top1=top1, top5=top5))
+        # compute output
+        output = model(images)
+        loss = criterion(output, target)
+
+        # measure accuracy and record loss
+        acc1, acc5 = accuracy(output, target, topk=(1, 5))
+        losses.update(loss.item(), images.size(0))
+        top1.update(acc1[0], images.size(0))
+        top5.update(acc5[0], images.size(0))
+
+        # measure elapsed time
+        batch_time.update(time.time() - end)
+        end = time.time()
+
+        if i % args.print_freq == 0:
+            progress.display(i)
+
+    # TODO: this should also be done with the ProgressMeter
+    print(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'
+            .format(top1=top1, top5=top5))
 
     return top1.avg
 
